@@ -177,14 +177,14 @@ async def chat_endpoint(
 
             # 🔹 EVALUATE
             context_text = " ".join([doc["text"] for doc in reranked_docs[:3]])
-            is_good = evaluate_answer(current_query, answer, context_text)
+            is_good = await evaluate_answer(current_query, answer, context_text)
 
             if is_good:
                 final_answer = answer
                 break
 
             # 🔹 REWRITE
-            current_query = rewrite_query(payload.query, answer)
+            current_query = await rewrite_query(payload.query, answer)
 
         if not final_answer:
             final_answer = answer
