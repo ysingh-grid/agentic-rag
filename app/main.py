@@ -168,7 +168,8 @@ async def chat_endpoint(
             )
 
             # 🔹 PROMPT
-            messages, _ = assemble_prompt(current_query, session, reranked_docs)
+            # MUST use payload.query here so the conversational context remains natural!
+            messages, _ = assemble_prompt(payload.query, session, reranked_docs)
 
             # 🔹 GENERATE (NO STREAM)
             answer = ""
@@ -176,7 +177,7 @@ async def chat_endpoint(
                 answer += token
 
             # 🔹 EVALUATE
-            context_text = " ".join([doc["text"] for doc in reranked_docs[:3]])
+            context_text = " ".join([doc.get("content", "") for doc in reranked_docs[:3]])
             is_good = await evaluate_answer(current_query, answer, context_text)
 
             if is_good:

@@ -32,7 +32,13 @@ Answer:
 Context:
 {context}
 
-Is the answer grounded in the context and correct?
+Is the answer grounded in the context AND does it make logical sense?
+Pay STRICT attention to logical and temporal constraints:
+- Sequences or date ranges MUST NOT go backwards in time.
+- Quantities, durations, and metrics must be realistic and logically consistent with the context.
+- The answer must accurately reflect the specific timeframe, subject, or constraints the user asked about.
+
+If the answer contains absurd logic, self-contradictions, hallucinated constraints, or improperly mixes unassociated facts from the context, you MUST reject it.
 
 Reply ONLY with:
 GOOD
@@ -45,7 +51,10 @@ BAD
         {"role": "user", "content": prompt}
     ])
 
-    return "GOOD" in result.upper()
+    result_upper = result.upper()
+    if "BAD" in result_upper:
+        return False
+    return "GOOD" in result_upper
 
 
 async def rewrite_query(original_query, last_answer):
