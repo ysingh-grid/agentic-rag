@@ -1,6 +1,5 @@
 import sys
 import asyncio
-import json
 import os
 from contextlib import asynccontextmanager
 
@@ -20,15 +19,23 @@ from app.ingestion import router as ingestion_router
 from app.auth import get_api_key
 from app.session import get_session, clear_session, RedisSessionStore
 from app.cache import cache_layer
-from app.retrieval import retriever, hybrid_retrieve, rerank_candidates, session_vector_search, reciprocal_rank_fusion
+from app.retrieval import (
+    retriever,
+    hybrid_retrieve,
+    rerank_candidates,
+    session_vector_search,
+)
 from app.context import assemble_prompt
 from app.agent import stream_llm_response
 from app.observability import tracer
+from app.multi_query import generate_queries
 
-from app.multi_query import generate_queries  # 🔥 NEW
+# 🔥 NEW
+from app.agent_utils import evaluate_answer, rewrite_query
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -89,102 +96,121 @@ async def chat_endpoint(
     request: Request,
     response: Response,
     payload: ChatRequest,
-    user: str = Depends(get_api_key)
+    user: str = Depends(get_api_key)  # remove if local-only
 ):
     session = await get_session(request, response)
     trace = tracer.trace(session_id=session.session_id, name="rag-query", query=payload.query)
 
     try:
-        # 1. Response Cache
+        # 🔹 1. RESPONSE CACHE
         cached_response = await cache_layer.get_response(
             session.session_id, payload.query, session.chat_history
         )
         if cached_response:
-            session.chat_history.append({"role": "user", "content": payload.query})
-            session.chat_history.append({"role": "assistant", "content": cached_response})
-            await session_module.session_store.set(session.session_id, session)
-
             async def _cached_gen():
                 yield cached_response
 
             return StreamingResponse(_cached_gen(), media_type="text/event-stream")
 
-        # 2. MULTI-QUERY 🔥
-        queries = generate_queries(payload.query, num_queries=3)
-
-        all_results = []
-
-        for q in queries:
-            # try retrieval cache per query
-            cached = await cache_layer.get_retrieval(
-                q, settings.RETRIEVAL_TOP_K, settings.RRF_K
-            )
-
-            if cached:
-                results = cached
-            else:
-                q_emb = await asyncio.to_thread(
-                    retriever.embedding_model.get_text_embedding, q
-                )
-
-                if session.session_docs:
-                    results = await session_vector_search(
-                        q_emb, session.session_docs, settings.RETRIEVAL_TOP_K
-                    )
-                else:
-                    results = await hybrid_retrieve(q, q_emb, settings.RETRIEVAL_TOP_K)
-
-                if results:
-                    await cache_layer.set_retrieval(
-                        q, settings.RETRIEVAL_TOP_K, settings.RRF_K, results
-                    )
-
-            if results:
-                all_results.extend(results)
-
-        # 3. DEDUP MULTI-QUERY RESULTS 🔥
-        seen_ids = set()
-        retrieved_docs = []
-        for doc in all_results:
-            doc_id = doc.get("id") if isinstance(doc, dict) else str(id(doc))
-            if doc_id not in seen_ids:
-                seen_ids.add(doc_id)
-                retrieved_docs.append(doc)
-
-        # 4. RERANK
-        reranked_docs = await rerank_candidates(
-            payload.query, retrieved_docs, settings.RERANK_TOP_N
-        )
-
-        # 5. PROMPT
-        messages, trimmed_history = assemble_prompt(payload.query, session, reranked_docs)
+        # 🔥 AGENT LOOP
+        max_attempts = 2
+        current_query = payload.query
+        final_answer = ""
         history_snapshot = list(session.chat_history)
 
-        # 6. STREAM RESPONSE
-        async def tracking_generator():
-            full_response = ""
+        for attempt in range(max_attempts):
 
-            async for token in stream_llm_response(messages):
-                yield token
-                full_response += token
+            # 🔹 MULTI-QUERY
+            queries = generate_queries(current_query, num_queries=3)
 
-            if full_response.strip() and "LLM_TIMEOUT" not in full_response:
-                session.chat_history.append({"role": "user", "content": payload.query})
-                session.chat_history.append({"role": "assistant", "content": full_response})
+            all_results = []
 
-                if len(session.chat_history) > 10:
-                    session.chat_history = session.chat_history[-10:]
-
-                await session_module.session_store.set(session.session_id, session)
-
-                await cache_layer.set_response(
-                    session.session_id,
-                    payload.query,
-                    history_snapshot,
-                    full_response
+            for q in queries:
+                cached = await cache_layer.get_retrieval(
+                    q, settings.RETRIEVAL_TOP_K, settings.RRF_K
                 )
 
-        return StreamingResponse(tracking_generator(), media_type="text/event-stream")
+                if cached:
+                    results = cached
+                else:
+                    q_emb = await asyncio.to_thread(
+                        retriever.embedding_model.get_text_embedding, q
+                    )
+
+                    if session.session_docs:
+                        results = await session_vector_search(
+                            q_emb, session.session_docs, settings.RETRIEVAL_TOP_K
+                        )
+                    else:
+                        results = await hybrid_retrieve(q, q_emb, settings.RETRIEVAL_TOP_K)
+
+                    if results:
+                        await cache_layer.set_retrieval(
+                            q, settings.RETRIEVAL_TOP_K, settings.RRF_K, results
+                        )
+
+                if results:
+                    all_results.extend(results)
+
+            # 🔹 DEDUP
+            seen_ids = set()
+            retrieved_docs = []
+
+            for doc in all_results:
+                doc_id = doc.get("id") if isinstance(doc, dict) else str(id(doc))
+                if doc_id not in seen_ids:
+                    seen_ids.add(doc_id)
+                    retrieved_docs.append(doc)
+
+            # 🔹 RERANK
+            reranked_docs = await rerank_candidates(
+                current_query, retrieved_docs, settings.RERANK_TOP_N
+            )
+
+            # 🔹 PROMPT
+            messages, _ = assemble_prompt(current_query, session, reranked_docs)
+
+            # 🔹 GENERATE (NO STREAM)
+            answer = ""
+            async for token in stream_llm_response(messages):
+                answer += token
+
+            # 🔹 EVALUATE
+            context_text = " ".join([doc["text"] for doc in reranked_docs[:3]])
+            is_good = evaluate_answer(current_query, answer, context_text)
+
+            if is_good:
+                final_answer = answer
+                break
+
+            # 🔹 REWRITE
+            current_query = rewrite_query(payload.query, answer)
+
+        if not final_answer:
+            final_answer = answer
+
+        # 🔹 UPDATE SESSION + CACHE
+        if final_answer.strip() and "LLM_TIMEOUT" not in final_answer:
+            session.chat_history.append({"role": "user", "content": payload.query})
+            session.chat_history.append({"role": "assistant", "content": final_answer})
+
+            if len(session.chat_history) > 10:
+                session.chat_history = session.chat_history[-10:]
+
+            await session_module.session_store.set(session.session_id, session)
+
+            await cache_layer.set_response(
+                session.session_id,
+                payload.query,
+                history_snapshot,
+                final_answer
+            )
+
+        # 🔹 STREAM FINAL ONLY
+        async def final_stream():
+            yield final_answer
+
+        return StreamingResponse(final_stream(), media_type="text/event-stream")
 
     finally:
         trace.end()
