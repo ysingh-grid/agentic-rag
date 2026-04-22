@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     LLM_CONCURRENCY: int = 3
     QUEUE_TIMEOUT: int = 30
     
+    # Network
+    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    
     # Data Stores
     REDIS_URL: str = "redis://localhost:6379/0"
     CHROMA_DB_DIR: str = "./db/chroma"

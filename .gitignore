@@ -7,4 +7,19 @@ wheels/
 *.egg-info
 
 # Virtual environments
+# Virtual environments
 .venv
+
+# Environment variables
+.env
+.env.local
+
+# Databases & Caches
+db/chroma/
+db/bm25_index.json
+*.sqlite3
+
+# IDE / OS files
+.DS_Store
+.idea/
+.vscode/

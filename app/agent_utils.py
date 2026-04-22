@@ -1,7 +1,8 @@
 import httpx
+from app.config import settings
 
-LLM_URL = "http://localhost:1234/v1/chat/completions"
-MODEL = "llama-3.2-3b-instruct"
+LLM_URL = f"{settings.LLM_BASE_URL}/chat/completions"
+MODEL = settings.LLM_MODEL_NAME
 
 
 async def call_llm(messages, temperature=0.2, max_tokens=300):

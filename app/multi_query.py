@@ -1,8 +1,9 @@
 import requests
 import json
+from app.config import settings
 
 def generate_queries(query, num_queries=3):
-    url = "http://localhost:1234/v1/chat/completions"
+    url = f"{settings.LLM_BASE_URL}/chat/completions"
 
     prompt = f"""
 Generate {num_queries} search queries similar to the input.
@@ -23,7 +24,7 @@ Input:
     response = requests.post(
         url,
         json={
-            "model": "llama-3.2-3b-instruct",
+            "model": settings.LLM_MODEL_NAME,
             "messages": [
                 {"role": "system", "content": "You generate search queries."},
                 {"role": "user", "content": prompt}
