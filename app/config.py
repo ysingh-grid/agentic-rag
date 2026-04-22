@@ -18,9 +18,9 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"
     RERANKER_MODEL: str = "BAAI/bge-reranker-base"
     
-    # LLM via LM Studio
-    LLM_BASE_URL: str = "http://127.0.0.1:1234/v1"
-    LLM_MODEL_NAME: str = "microsoft/phi-4-mini-reasoning"
+    # LLM
+    LLM_BASE_URL: str = "http://localhost:1234/v1"
+    LLM_MODEL_NAME: str = "llama-3.2-3b-instruct"
     
     # Concurrency & load handling
     LLM_CONCURRENCY: int = 3

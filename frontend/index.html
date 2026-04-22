@@ -161,6 +161,43 @@
         }
 
         .send-btn:hover { background-color: var(--primary-hover); }
+
+        /* Active session document badge */
+        #session-doc-badge {
+            display: none;
+            align-items: center;
+            gap: 0.4rem;
+            background: rgba(187,134,252,0.12);
+            border: 1px solid rgba(187,134,252,0.35);
+            border-radius: 20px;
+            padding: 0.3rem 0.8rem;
+            font-size: 0.78rem;
+            color: var(--primary-color);
+            max-width: 220px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        #session-doc-badge.active { display: flex; }
+        #session-doc-badge .doc-icon { font-size: 0.9rem; }
+        #session-doc-badge .remove-doc {
+            cursor: pointer; opacity: 0.7; margin-left: 0.2rem;
+        }
+        #session-doc-badge .remove-doc:hover { opacity: 1; }
+
+        .upload-btn {
+            background: transparent;
+            border: 1px solid var(--border-color);
+            border-radius: 50%;
+            width: 42px; height: 42px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 1.1rem;
+            cursor: pointer;
+            flex-shrink: 0;
+            transition: all 0.2s;
+        }
+        .upload-btn:hover { background: rgba(255,255,255,0.06); border-color: var(--primary-color); }
+        .upload-btn.uploading { animation: spin 1s linear infinite; }
         
         .sys-msg {
             align-self: center;
@@ -202,7 +239,18 @@
     </div>
 
     <div class="input-area">
+        <div style="max-width:800px;margin:0 auto 0.5rem;padding:0 0">
+            <div id="session-doc-badge">
+                <span class="doc-icon">📄</span>
+                <span id="doc-name">document.pdf</span>
+                <span class="remove-doc" title="Remove document" id="remove-doc-btn">✕</span>
+            </div>
+        </div>
         <form class="input-wrapper" id="chat-form">
+            <input type="file" id="file-input" accept=".pdf,.txt" style="display:none">
+            <button type="button" class="upload-btn" id="upload-btn" title="Upload PDF or TXT to chat with">
+                📎
+            </button>
             <input type="text" id="query-input" placeholder="Ask a question about your documents..." autocomplete="off">
             <button type="submit" class="send-btn" id="send-btn">Send</button>
         </form>
@@ -220,10 +268,17 @@
         const form = document.getElementById('chat-form');
         const input = document.getElementById('query-input');
         const sendBtn = document.getElementById('send-btn');
+        const uploadBtn = document.getElementById('upload-btn');
+        const fileInput = document.getElementById('file-input');
+        const sessionDocBadge = document.getElementById('session-doc-badge');
+        const docNameEl = document.getElementById('doc-name');
+        const removeDocBtn = document.getElementById('remove-doc-btn');
         const statusDot = document.querySelector('.status-dot');
         const statusText = document.getElementById('status-text');
 
-        // Check health on load
+        let activeSessionDoc = null;  // filename of currently uploaded session doc
+
+        // ── Health check ─────────────────────────────────────────────────────
         async function checkHealth() {
             try {
                 const res = await fetch(`${API_BASE}/health`);
@@ -258,6 +313,65 @@
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
 
+        // ── Session-doc upload ────────────────────────────────────────────────
+        uploadBtn.addEventListener('click', () => fileInput.click());
+
+        fileInput.addEventListener('change', async () => {
+            const file = fileInput.files[0];
+            if (!file) return;
+            fileInput.value = ''; // reset so same file can be re-uploaded
+
+            uploadBtn.classList.add('uploading');
+            uploadBtn.disabled = true;
+            addSystemMessage(`⏳ Processing '${file.name}' — chunking & embedding…`);
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                const res = await fetch(`${API_BASE}/chat/upload`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${DEV_API_KEY}` },
+                    credentials: 'include',
+                    body: formData,
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    addSystemMessage(`❌ Upload failed: ${data.detail || res.statusText}`);
+                    return;
+                }
+                activeSessionDoc = file.name;
+                docNameEl.textContent = file.name;
+                sessionDocBadge.classList.add('active');
+                input.placeholder = `Ask anything about '${file.name}'…`;
+                addSystemMessage(
+                    `✅ '${file.name}' ready — ${data.chunks} chunks loaded. ` +
+                    `This document is available for this session only.`
+                );
+            } catch (err) {
+                addSystemMessage(`❌ Upload error: ${err.message}`);
+            } finally {
+                uploadBtn.classList.remove('uploading');
+                uploadBtn.disabled = false;
+            }
+        });
+
+        removeDocBtn.addEventListener('click', async () => {
+            // Clear session to wipe session_docs from Redis
+            try {
+                await fetch(`${API_BASE}/clear-session`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${DEV_API_KEY}` },
+                    credentials: 'include',
+                });
+            } catch (_) {}
+            activeSessionDoc = null;
+            sessionDocBadge.classList.remove('active');
+            input.placeholder = 'Ask a question about your documents…';
+            addSystemMessage('Document removed. Now using the global knowledge base.');
+        });
+
+        // ── Clear chat ────────────────────────────────────────────────────────
         document.getElementById('clear-btn').addEventListener('click', async () => {
             try {
                 const res = await fetch(`${API_BASE}/clear-session`, {

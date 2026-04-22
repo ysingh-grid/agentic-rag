@@ -25,6 +25,7 @@ dependencies = [
     "tiktoken>=0.7.0",
     "python-multipart>=0.0.26",
     "llama-index-embeddings-huggingface>=0.7.0",
+    "pypdf>=4.0.0",
 ]
 
 [project.optional-dependencies]

@@ -15,6 +15,9 @@ class SessionData(BaseModel):
     metadata: dict = {}
     last_activity: float
     created_at: float
+    # Per-session document chunks. Each entry: {id, content, embedding, metadata}.
+    # Populated by /chat/upload — scoped to this session only, never written to ChromaDB.
+    session_docs: list[dict] = []
 
 
 class SessionStore:

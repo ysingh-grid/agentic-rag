@@ -20,48 +20,42 @@ from app.ingestion import router as ingestion_router
 from app.auth import get_api_key
 from app.session import get_session, clear_session, RedisSessionStore
 from app.cache import cache_layer
-from app.retrieval import retriever, hybrid_retrieve, rerank_candidates
+from app.retrieval import retriever, hybrid_retrieve, rerank_candidates, session_vector_search, reciprocal_rank_fusion
 from app.context import assemble_prompt
 from app.agent import stream_llm_response
 from app.observability import tracer
 
-# Rate limiter setup
+from app.multi_query import generate_queries  # 🔥 NEW
+
+# Rate limiter
 limiter = Limiter(key_func=get_remote_address)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _redis_client = None
-    # Try connecting to Redis
     try:
         from redis.asyncio import Redis
         _redis_client = Redis.from_url(settings.REDIS_URL, decode_responses=False)
         await _redis_client.ping()
 
-        # Update the module-level session_store so all get_session() calls use Redis
         session_module.session_store = RedisSessionStore(_redis_client)
-
-        # Wire Redis into health-check and cache
         health_set_redis(_redis_client)
         cache_layer.setup(_redis_client)
+
         print("Redis connected successfully.")
     except Exception as e:
-        print(f"Failed to connect to Redis. Running in-memory (degraded). Error: {e}", file=sys.stderr)
+        print(f"Redis unavailable. Using in-memory. Error: {e}", file=sys.stderr)
 
     retriever.load_models()
-    print("Models and indexes loaded.")
+    print("Models loaded.")
 
     yield
 
-    # Graceful shutdown: drain active background tasks then close Redis
-    pending = [t for t in asyncio.all_tasks() if not t.done()]
-    if pending:
+    if _redis_client:
         try:
-            await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=30)
-        except asyncio.TimeoutError:
+            await _redis_client.aclose()
+        except Exception:
             pass
-
-    if _redis_client is not None:
-        await _redis_client.aclose()
 
 
 app = FastAPI(
@@ -70,11 +64,9 @@ app = FastAPI(
     docs_url="/docs" if settings.DEBUG else None
 )
 
-# Exception handlers
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -83,13 +75,13 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
-# Routers
 app.include_router(health_router)
 app.include_router(ingestion_router)
 
-# Request Models
+
 class ChatRequest(BaseModel):
     query: str = Field(..., max_length=settings.MAX_QUERY_LENGTH)
+
 
 @app.post("/chat")
 @limiter.limit("10/minute")
@@ -100,12 +92,10 @@ async def chat_endpoint(
     user: str = Depends(get_api_key)
 ):
     session = await get_session(request, response)
-
-    # Observability main trace
     trace = tracer.trace(session_id=session.session_id, name="rag-query", query=payload.query)
 
     try:
-        # 1. Response Cache Check — key uses history BEFORE this turn is appended
+        # 1. Response Cache
         cached_response = await cache_layer.get_response(
             session.session_id, payload.query, session.chat_history
         )
@@ -119,52 +109,79 @@ async def chat_endpoint(
 
             return StreamingResponse(_cached_gen(), media_type="text/event-stream")
 
-        # 2. Embedding Cache Check & Generation
-        query_emb = await cache_layer.get_embedding(payload.query)
-        if not query_emb:
-            query_emb = await asyncio.to_thread(
-                retriever.embedding_model.get_text_embedding, payload.query
-            )
-            await cache_layer.set_embedding(payload.query, query_emb)
+        # 2. MULTI-QUERY 🔥
+        queries = generate_queries(payload.query, num_queries=3)
 
-        # 3. Retrieval Cache Check & Hybrid Retrieval
-        retrieved_docs = await cache_layer.get_retrieval(
-            payload.query, settings.RETRIEVAL_TOP_K, settings.RRF_K
-        )
-        if not retrieved_docs:
-            retrieved_docs = await hybrid_retrieve(payload.query, query_emb, settings.RETRIEVAL_TOP_K)
-            if retrieved_docs:
-                await cache_layer.set_retrieval(
-                    payload.query, settings.RETRIEVAL_TOP_K, settings.RRF_K, retrieved_docs
+        all_results = []
+
+        for q in queries:
+            # try retrieval cache per query
+            cached = await cache_layer.get_retrieval(
+                q, settings.RETRIEVAL_TOP_K, settings.RRF_K
+            )
+
+            if cached:
+                results = cached
+            else:
+                q_emb = await asyncio.to_thread(
+                    retriever.embedding_model.get_text_embedding, q
                 )
 
-        # 4. Cross-Encoder Reranking
-        reranked_docs = await rerank_candidates(payload.query, retrieved_docs, settings.RERANK_TOP_N)
+                if session.session_docs:
+                    results = await session_vector_search(
+                        q_emb, session.session_docs, settings.RETRIEVAL_TOP_K
+                    )
+                else:
+                    results = await hybrid_retrieve(q, q_emb, settings.RETRIEVAL_TOP_K)
 
-        # 5. Assemble prompt (passes trimmed history into the prompt string)
+                if results:
+                    await cache_layer.set_retrieval(
+                        q, settings.RETRIEVAL_TOP_K, settings.RRF_K, results
+                    )
+
+            if results:
+                all_results.extend(results)
+
+        # 3. DEDUP MULTI-QUERY RESULTS 🔥
+        seen_ids = set()
+        retrieved_docs = []
+        for doc in all_results:
+            doc_id = doc.get("id") if isinstance(doc, dict) else str(id(doc))
+            if doc_id not in seen_ids:
+                seen_ids.add(doc_id)
+                retrieved_docs.append(doc)
+
+        # 4. RERANK
+        reranked_docs = await rerank_candidates(
+            payload.query, retrieved_docs, settings.RERANK_TOP_N
+        )
+
+        # 5. PROMPT
         messages, trimmed_history = assemble_prompt(payload.query, session, reranked_docs)
-
-        # Snapshot history BEFORE the new turn for the response-cache key
         history_snapshot = list(session.chat_history)
 
-        # 6. Stream and persist
+        # 6. STREAM RESPONSE
         async def tracking_generator():
             full_response = ""
+
             async for token in stream_llm_response(messages):
                 yield token
                 full_response += token
 
-            # Only persist a clean (non-error) response
             if full_response.strip() and "LLM_TIMEOUT" not in full_response:
                 session.chat_history.append({"role": "user", "content": payload.query})
                 session.chat_history.append({"role": "assistant", "content": full_response})
-                # Enforce sliding window on stored history too
-                if len(session.chat_history) > 10:  # 5 turns × 2 messages
+
+                if len(session.chat_history) > 10:
                     session.chat_history = session.chat_history[-10:]
+
                 await session_module.session_store.set(session.session_id, session)
-                # Key uses pre-turn snapshot so get_response() can reconstruct the correct key
+
                 await cache_layer.set_response(
-                    session.session_id, payload.query, history_snapshot, full_response
+                    session.session_id,
+                    payload.query,
+                    history_snapshot,
+                    full_response
                 )
 
         return StreamingResponse(tracking_generator(), media_type="text/event-stream")
@@ -172,23 +189,26 @@ async def chat_endpoint(
     finally:
         trace.end()
 
+
 @app.post("/clear-session")
 async def clear_session_endpoint(
     request: Request,
     user: str = Depends(get_api_key)
 ):
     cleared = await clear_session(request)
-    # Response-cache keys are tied to the session history hash;
-    # clearing history means all old keys will never match again — no explicit scan needed.
+
     if cleared:
         return {"status": "success", "message": "Session history cleared"}
+
     raise HTTPException(status_code=404, detail="No active session found")
 
-# Mount static frontend LAST so it never shadows API routes.
-# A catch-all static mount registered before routers blocks /chat, /health etc.
+
+# Static frontend
 frontend_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
+
 if os.path.exists(frontend_dir):
-    app.mount("/ui", StaticFiles(directory=frontend_dir, html=True), name="static")
+    app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="static")
+
 
 if __name__ == "__main__":
     import uvicorn

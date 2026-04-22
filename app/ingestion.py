@@ -5,10 +5,10 @@ import logging
 import os
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Request, Response
 from llama_index.core.node_parser import SentenceSplitter
 
-from app.auth import get_admin_key
+from app.auth import get_admin_key, get_api_key
 from app.config import settings
 from app.retrieval import retriever
 
@@ -122,4 +122,108 @@ async def ingest_document(
     return {
         "message": f"Document '{file.filename}' queued for ingestion.",
         "doc_id": doc_id,
+    }
+
+
+def _extract_text_from_pdf(content_bytes: bytes) -> str:
+    """Extract plain text from a PDF byte payload using pypdf."""
+    import io
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(content_bytes))
+    pages = []
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            pages.append(text)
+    return "\n\n".join(pages)
+
+
+@router.post("/chat/upload")
+async def upload_session_document(
+    request: Request,
+    response: Response,
+    file: UploadFile = File(...),
+    user: str = Depends(get_api_key),
+):
+    """Upload a PDF or TXT file to chat with — scoped to the current session only.
+
+    Chunks are stored inside the session object in Redis.
+    They are never written to ChromaDB or the BM25 index.
+    They vanish automatically when the session expires.
+    """
+    from app.session import get_session
+    import app.session as session_module
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+
+    content_bytes = await file.read()
+    if not content_bytes:
+        raise HTTPException(status_code=400, detail="File is empty")
+
+    filename_lower = (file.filename or "").lower()
+
+    # Text extraction
+    try:
+        if filename_lower.endswith(".pdf"):
+            text = await asyncio.to_thread(_extract_text_from_pdf, content_bytes)
+        else:
+            text = content_bytes.decode("utf-8")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
+
+    if not text.strip():
+        raise HTTPException(status_code=422, detail="No readable text found in the file")
+
+    # Chunk
+    parser = SentenceSplitter(chunk_size=512, chunk_overlap=50)
+    chunks = parser.split_text(text)
+    if not chunks:
+        raise HTTPException(status_code=422, detail="File produced no chunks after splitting")
+
+    # Embed all chunks (CPU-bound — run in thread pool)
+    def embed_chunks():
+        return [
+            retriever.embedding_model.get_text_embedding(c)
+            for c in chunks
+        ]
+
+    embeddings = await asyncio.to_thread(embed_chunks)
+
+    # Build session_docs list
+    doc_id = _make_doc_id(file.filename)
+    timestamp = asyncio.get_event_loop().time()
+    session_docs = [
+        {
+            "id": f"{doc_id}_{i}",
+            "content": chunk,
+            "embedding": emb,
+            "metadata": {
+                "source": file.filename,
+                "chunk_index": i,
+                "doc_id": doc_id,
+                "uploaded_at": timestamp,
+            },
+        }
+        for i, (chunk, emb) in enumerate(zip(chunks, embeddings))
+    ]
+
+    # Persist into session
+    session = await get_session(request, response)
+    # Replace any previously uploaded session docs from the same file; keep others
+    session.session_docs = [
+        d for d in session.session_docs
+        if d.get("metadata", {}).get("doc_id") != doc_id
+    ] + session_docs
+    await session_module.session_store.set(session.session_id, session)
+
+    logger.info(
+        "Session %s: uploaded '%s' → %d chunks (session-scoped).",
+        session.session_id, file.filename, len(chunks),
+    )
+    return {
+        "message": f"'{file.filename}' uploaded successfully.",
+        "chunks": len(chunks),
+        "doc_id": doc_id,
+        "scope": "session",
     }

@@ -20,7 +20,7 @@ _SLOW_WARNING_AFTER = 20.0  # seconds before "Still generating..." token
 async def _call_lm_studio(messages: list[dict], attempt: int = 1) -> AsyncGenerator[str, None]:
     """Single streaming call to LM Studio. Raises on non-200 or timeout.
     
-    Note: reasoning models (e.g. phi-4-mini-reasoning) emit thinking tokens
+    Note: reasoning models typically emit thinking tokens
     via delta.reasoning_content before the final answer in delta.content.
     max_tokens must be large enough to cover BOTH phases.
     """
@@ -30,7 +30,7 @@ async def _call_lm_studio(messages: list[dict], attempt: int = 1) -> AsyncGenera
         "stream": True,
         "temperature": 0.3,
         # 8192 gives reasoning models enough room to think AND answer.
-        # Phi-4-mini will easily exhaust 1024 tokens just on its <think> block.
+        # Reasoning models will easily exhaust 1024 tokens just on their <think> block.
         "max_tokens": 8192,
     }
     async with httpx.AsyncClient(timeout=_LLM_CALL_TIMEOUT) as client:

@@ -6,7 +6,7 @@ from app.session import SessionData
 
 logger = logging.getLogger(__name__)
 
-# Phi-4-mini has an 8k context window; we budget 85% of it.
+# Llama-3.2-3B has a large context window; we budget 85% of an 8k footprint.
 MAX_TOKENS = int(8000 * 0.85)  # 6800 tokens
 
 # Cache the tiktoken encoder object (thread-safe singleton)

@@ -133,20 +133,56 @@ async def hybrid_retrieve(query: str, query_embedding: list[float], top_k: int =
 async def rerank_candidates(query: str, candidates: list[dict], top_n: int = settings.RERANK_TOP_N):
     if not candidates:
         return []
-        
+
     if not retriever.cross_encoder:
         return candidates[:top_n]
-        
+
     cross_input = [[query, doc.get("content", "")] for doc in candidates]
-    
+
     # Batched inference
     scores = await asyncio.to_thread(retriever.cross_encoder.predict, cross_input)
-    
+
     # Assign scores and sort
     scored_candidates = []
     for doc, score in zip(candidates, scores):
         doc["rerank_score"] = float(score)
         scored_candidates.append(doc)
-        
+
     scored_candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
     return scored_candidates[:top_n]
+
+
+async def session_vector_search(
+    query_embedding: list[float],
+    session_docs: list[dict],
+    top_k: int,
+) -> list[dict]:
+    """In-memory cosine similarity search over per-session document chunks.
+
+    session_docs entries must have an "embedding" key (list[float]).
+    Returns up to top_k docs sorted by descending cosine similarity.
+    This never touches ChromaDB — results are ephemeral to the session.
+    """
+    if not session_docs:
+        return []
+
+    import numpy as np
+
+    q = np.array(query_embedding, dtype=np.float32)
+    q_norm = q / (np.linalg.norm(q) + 1e-8)
+
+    doc_embs = np.array(
+        [d["embedding"] for d in session_docs], dtype=np.float32
+    )
+    norms = np.linalg.norm(doc_embs, axis=1, keepdims=True) + 1e-8
+    doc_norm = doc_embs / norms
+
+    scores = doc_norm @ q_norm  # shape (N,)
+    top_indices = np.argsort(scores)[::-1][:top_k]
+
+    return [
+        {**{k: v for k, v in session_docs[i].items() if k != "embedding"},
+         "session_score": float(scores[i])}
+        for i in top_indices
+        if scores[i] > 0.0
+    ]

@@ -5,9 +5,9 @@ A production-grade, network-exposed Agentic RAG system built with FastAPI, Redis
 ## Prerequisites
 
 1.  **Python Packages:** You've successfully synced using `uv sync`.
-2.  **LM Studio:** Must be running locally on port `1234`. 
-    - Go to LM Studio, load your model (`microsoft/phi-4-mini-reasoning`).
-    - Start the Local Server (should show `http://127.0.0.1:1234/v1` as the base URL).
+2.  **LM Studio:**    - Set CORS domains explicitly in LM Studio to allow `http://localhost:3000` 
+    - Go to LM Studio, load your model (`llama-3.2-3b-instruct`).
+    - Start the server (default runs on `http://localhost:1234`)./v1` as the base URL).
 3.  **Docker:** Required for running the Redis cache layer.
 
 ## How to Run
