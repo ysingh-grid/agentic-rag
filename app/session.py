@@ -129,6 +129,7 @@ async def clear_session(request: Request) -> bool:
         session_data = await session_store.get(session_id)
         if session_data:
             session_data.chat_history = []
+            session_data.session_docs = []
             session_data.last_activity = time.time()
             await session_store.set(session_id, session_data)
             return True
